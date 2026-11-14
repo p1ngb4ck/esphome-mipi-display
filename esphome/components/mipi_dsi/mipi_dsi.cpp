@@ -4,6 +4,10 @@
 #include "mipi_dsi.h"
 #include "esphome/core/helpers.h"
 #include "hal/mipi_dsi_hal.h"
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+#include <cmath>
+#include "esp_cache.h"
+#endif
 #include "hal/mipi_dsi_host_ll.h"
 
 #include <hal/axi_icm_ll.h>
@@ -19,15 +23,22 @@ static constexpr size_t MIPI_DSI_MAX_CMD_LOG_BYTES = 64;
 // Highest AXI QoS priority (4 bits); all masters start at 0
 static constexpr uint32_t DSI_DMA_READ_PRIORITY = 15;
 
-bool MipiDsi::notify_refresh_ready_(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata,
-                                    void *user_ctx) {
+// With CONFIG_LCD_DSI_ISR_CACHE_SAFE the DPI driver only accepts callbacks in IRAM
+#if CONFIG_LCD_DSI_ISR_CACHE_SAFE
+#define MIPI_DSI_ISR_ATTR IRAM_ATTR
+#else
+#define MIPI_DSI_ISR_ATTR
+#endif
+
+bool MIPI_DSI_ISR_ATTR MipiDsi::notify_refresh_ready_(esp_lcd_panel_handle_t panel,
+                                                      esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
   BaseType_t need_yield = pdFALSE;
   xSemaphoreGiveFromISR(static_cast<MipiDsi *>(user_ctx)->io_lock_, &need_yield);
   return (need_yield == pdTRUE);
 }
 
-bool MipiDsi::notify_frame_started_(esp_lcd_panel_handle_t panel, esp_lcd_dpi_panel_event_data_t *edata,
-                                    void *user_ctx) {
+bool MIPI_DSI_ISR_ATTR MipiDsi::notify_frame_started_(esp_lcd_panel_handle_t panel,
+                                                      esp_lcd_dpi_panel_event_data_t *edata, void *user_ctx) {
   auto *self = static_cast<MipiDsi *>(user_ctx);
   const uint32_t frames = self->scan_frames_.fetch_add(1, std::memory_order_acq_rel) + 1;
   if (self->flip_waiting_.load(std::memory_order_acquire) &&
@@ -194,8 +205,169 @@ void MipiDsi::setup() {
   axi_icm_ll_set_dw_gdma_qos_arbiter_prio(0, 0, DSI_DMA_READ_PRIORITY);
   axi_icm_ll_set_dw_gdma_qos_arbiter_prio(1, 0, DSI_DMA_READ_PRIORITY);
 
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+  this->boot_start_();
+#endif
   ESP_LOGCONFIG(TAG, "MIPI DSI setup complete");
 }
+
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+static constexpr int BOOT_RING_RADIUS = 112;
+static constexpr float BOOT_RING_HALF_WIDTH = 2.5f;
+static constexpr float BOOT_HEAD_RADIUS = 6.0f;
+static constexpr int BOOT_HEAD_DOT = 8;
+static constexpr int BOOT_RING_POINTS = 180;
+static constexpr int BOOT_START_PERCENT = 10;
+static constexpr int BOOT_ADVANCE = 3;
+static constexpr int BOOT_FILL_START = 60;
+static constexpr uint64_t BOOT_TICK_US = 40000;
+
+void MipiDsi::boot_rect_(int x, int y, int w, int h, Color color) {
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  const uint16_t raw = display::ColorUtil::color_to_565(color);
+  const uint16_t value = this->big_endian_ ? convert_big_endian(raw) : raw;
+  for (int row = 0; row < h; row++)
+    std::fill_n(fb + (y + row) * stride + x, w, value);
+}
+
+void MipiDsi::boot_sync_(int top, int rows) {
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  esp_cache_msync(fb + top * stride, static_cast<size_t>(rows * stride) * 2,
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+}
+
+static Color boot_mix(const Color &from, const Color &to, int weight) {
+  const auto mix = [weight](uint8_t a, uint8_t b) { return static_cast<uint8_t>(a + (b - a) * weight / 255); };
+  return Color(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b));
+}
+
+void MipiDsi::boot_ring_paint_(int head) {
+  const Color ring(0x2A, 0x2E, 0x3D);
+  const Color accent(0x7A, 0xA2, 0xF7);
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  const float outer = BOOT_RING_RADIUS + BOOT_RING_HALF_WIDTH + 1.0f;
+  const float inner = BOOT_RING_RADIUS - BOOT_RING_HALF_WIDTH - 1.0f;
+  const int rows = static_cast<int>(ceilf(outer));
+  const float turn = 2.0f * static_cast<float>(M_PI);
+  const auto put = [&](int dx, int dy, float y2) {
+    const float distance = sqrtf(static_cast<float>(dx * dx) + y2);
+    const float cover = std::min(1.0f, BOOT_RING_HALF_WIDTH + 0.5f - fabsf(distance - BOOT_RING_RADIUS));
+    if (cover <= 0.0f)
+      return;
+    float angle = atan2f(static_cast<float>(dx), static_cast<float>(-dy));
+    if (angle < 0.0f)
+      angle += turn;
+    const float position = angle / turn * BOOT_RING_POINTS;
+    Color color = ring;
+    if (head > 0 && position <= static_cast<float>(head))
+      color = boot_mix(ring, accent, BOOT_FILL_START + static_cast<int>((255 - BOOT_FILL_START) * position / head));
+    const uint16_t raw = display::ColorUtil::color_to_565(boot_mix(this->boot_background_, color, static_cast<int>(cover * 255.0f)));
+    fb[(this->boot_cy_ + dy) * stride + this->boot_cx_ + dx] = this->big_endian_ ? convert_big_endian(raw) : raw;
+  };
+  for (int dy = -rows; dy <= rows; dy++) {
+    const float y2 = static_cast<float>(dy * dy);
+    if (y2 > outer * outer)
+      continue;
+    const int from = y2 < inner * inner ? static_cast<int>(floorf(sqrtf(inner * inner - y2))) : 0;
+    const int to = static_cast<int>(ceilf(sqrtf(outer * outer - y2)));
+    for (int dx = from; dx <= to; dx++) {
+      put(dx, dy, y2);
+      if (dx != 0)
+        put(-dx, dy, y2);
+    }
+  }
+}
+
+void MipiDsi::boot_head_paint_(int head, Color color) {
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const int stride = static_cast<int>(this->width_);
+  const float angle = static_cast<float>(head) * 2.0f * static_cast<float>(M_PI) / BOOT_RING_POINTS;
+  const float cx = static_cast<float>(this->boot_cx_) + sinf(angle) * BOOT_RING_RADIUS;
+  const float cy = static_cast<float>(this->boot_cy_) - cosf(angle) * BOOT_RING_RADIUS;
+  const int reach = static_cast<int>(ceilf(BOOT_HEAD_RADIUS + 1.0f));
+  for (int y = static_cast<int>(cy) - reach; y <= static_cast<int>(cy) + reach; y++) {
+    for (int x = static_cast<int>(cx) - reach; x <= static_cast<int>(cx) + reach; x++) {
+      const float dx = static_cast<float>(x) - cx;
+      const float dy = static_cast<float>(y) - cy;
+      const float cover = std::min(1.0f, BOOT_HEAD_RADIUS + 0.5f - sqrtf(dx * dx + dy * dy));
+      if (cover <= 0.0f)
+        continue;
+      uint16_t &pixel = fb[y * stride + x];
+      const uint16_t now = this->big_endian_ ? convert_big_endian(pixel) : pixel;
+      const Color under((now >> 11 & 0x1F) * 255 / 31, (now >> 5 & 0x3F) * 255 / 63, (now & 0x1F) * 255 / 31);
+      const uint16_t raw = display::ColorUtil::color_to_565(boot_mix(under, color, static_cast<int>(cover * 255.0f)));
+      pixel = this->big_endian_ ? convert_big_endian(raw) : raw;
+    }
+  }
+}
+
+void MipiDsi::boot_start_() {
+  if (this->boot_image_ == nullptr || this->draw_fb_ == nullptr || this->get_bytes_per_pixel() != 2)
+    return;
+  const int image_w = this->boot_image_->get_width();
+  const int image_h = this->boot_image_->get_height();
+  const int fb_w = static_cast<int>(this->width_);
+  const int fb_h = static_cast<int>(this->height_);
+  if (image_w > fb_w || image_h > fb_h || fb_h / 2 < BOOT_RING_RADIUS + BOOT_HEAD_DOT)
+    return;
+  auto *fb = static_cast<uint16_t *>(this->draw_fb_);
+  const auto pixel = [this](int x, int y) {
+    const uint16_t value = display::ColorUtil::color_to_565(this->boot_image_->get_pixel(x, y));
+    return this->big_endian_ ? convert_big_endian(value) : value;
+  };
+  this->boot_background_ = this->boot_image_->get_pixel(0, 0);
+  std::fill_n(fb, fb_w * fb_h, pixel(0, 0));
+  const int left = (fb_w - image_w) / 2;
+  const int top = (fb_h - image_h) / 2;
+  for (int y = 0; y < image_h; y++) {
+    for (int x = 0; x < image_w; x++)
+      fb[(top + y) * fb_w + left + x] = pixel(x, y);
+  }
+  this->boot_cx_ = fb_w / 2;
+  this->boot_cy_ = fb_h / 2;
+  this->boot_base_ = std::min<uint8_t>(App.setup_percent(), 99);
+  this->boot_ring_paint_(0);
+  this->boot_sync_(0, fb_h);
+  esp_timer_create_args_t args{};
+  args.callback = [](void *arg) { static_cast<MipiDsi *>(arg)->boot_tick_(); };
+  args.arg = this;
+  args.name = "boot_screen";
+  if (esp_timer_create(&args, &this->boot_timer_) == ESP_OK)
+    esp_timer_start_periodic(this->boot_timer_, BOOT_TICK_US);
+}
+
+void MipiDsi::boot_tick_() {
+  const Color accent(0x7A, 0xA2, 0xF7);
+  const int raw = std::max<int>(this->boot_base_, std::max<uint8_t>(App.setup_percent(), this->boot_percent_));
+  const int mapped = BOOT_START_PERCENT + (raw - this->boot_base_) * (100 - BOOT_START_PERCENT) / (100 - this->boot_base_);
+  this->boot_shown_ = std::max<uint8_t>(this->boot_shown_, static_cast<uint8_t>(std::min(mapped, 100)));
+  const int target = BOOT_RING_POINTS * static_cast<int>(this->boot_shown_) / 100;
+  const int before = static_cast<int>(this->boot_step_);
+  const int head = before == 0 ? target : std::min<int>(target, before + BOOT_ADVANCE);
+  if (head == before)
+    return;
+  this->boot_step_ = static_cast<uint32_t>(head);
+  if (before != 0) {
+    const float angle = static_cast<float>(before) * 2.0f * static_cast<float>(M_PI) / BOOT_RING_POINTS;
+    const int reach = static_cast<int>(ceilf(BOOT_HEAD_RADIUS + 1.0f));
+    this->boot_rect_(this->boot_cx_ + static_cast<int>(sinf(angle) * BOOT_RING_RADIUS) - reach - 1,
+                     this->boot_cy_ - static_cast<int>(cosf(angle) * BOOT_RING_RADIUS) - reach - 1, 2 * reach + 3, 2 * reach + 3,
+                     this->boot_background_);
+  }
+  this->boot_ring_paint_(head);
+  this->boot_head_paint_(head, accent);
+  this->boot_sync_(this->boot_cy_ - BOOT_RING_RADIUS - BOOT_HEAD_DOT, 2 * (BOOT_RING_RADIUS + BOOT_HEAD_DOT));
+}
+
+void MipiDsi::boot_stop_() {
+  esp_timer_stop(this->boot_timer_);
+  esp_timer_delete(this->boot_timer_);
+  this->boot_timer_ = nullptr;
+}
+#endif
 
 void MipiDsi::present_dsi_frame_buffer(void *fb) {
   esp_lcd_panel_draw_bitmap(this->handle_, 0, 0, this->width_, this->height_, fb);
@@ -214,6 +386,10 @@ uint8_t MipiDsi::get_scanout_buffers(void **out, uint8_t max, display::ColorBitn
 }
 
 void MipiDsi::present_scanout_buffer(void *buffer) {
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+  if (this->boot_timer_ != nullptr && buffer != this->draw_fb_)
+    this->boot_stop_();
+#endif
   esp_lcd_panel_draw_bitmap(this->handle_, 0, 0, 1, 1, buffer);
   xSemaphoreTake(this->io_lock_, 0);
   this->draw_fb_ = buffer;
@@ -313,6 +489,10 @@ void MipiDsi::draw_pixels_internal(int x_start, int y_start, int w, int h, const
 
 void MipiDsi::write_to_display_(int x_start, int y_start, int w, int h, const uint8_t *ptr, int x_offset, int y_offset,
                                 int x_pad) {
+#ifdef USE_MIPI_DSI_BOOT_IMAGE
+  if (this->boot_timer_ != nullptr)
+    this->boot_stop_();
+#endif
   esp_err_t err = ESP_OK;
   auto bytes_per_pixel = 3 - this->color_depth_;
   auto stride = (x_offset + w + x_pad) * bytes_per_pixel;
