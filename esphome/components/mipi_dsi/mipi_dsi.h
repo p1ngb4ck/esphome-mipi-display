@@ -13,10 +13,6 @@
 
 #include "esphome/components/display/display.h"
 #include "esphome/components/display/display_color_utils.h"
-#ifdef USE_MIPI_DSI_BOOT_IMAGE
-#include "esphome/components/image/image.h"
-#include "esp_timer.h"
-#endif
 #ifdef USE_I2C
 #include "esphome/components/i2c/i2c.h"
 #endif
@@ -76,10 +72,6 @@ class MipiDsi final : public display::Display {
   void set_lane_bit_rate(float lane_bit_rate) { this->lane_bit_rate_ = lane_bit_rate; }
   void set_lanes(uint8_t lanes) { this->lanes_ = lanes; }
   void set_frame_buffers(uint8_t n) { this->num_fbs_ = n; }
-#ifdef USE_MIPI_DSI_BOOT_IMAGE
-  void set_boot_image(image::Image *boot_image) { this->boot_image_ = boot_image; }
-  void set_boot_progress(uint8_t percent) { this->boot_percent_ = percent; }
-#endif
   void set_video_mode(uint8_t mode) { this->video_mode_ = mode; }
   void set_frame_ack(bool frame_ack) { this->frame_ack_ = frame_ack; }
   void set_continuous_clock(bool continuous) { this->continuous_clock_ = continuous; }
@@ -203,24 +195,6 @@ class MipiDsi final : public display::Display {
 
   esp_lcd_panel_handle_t handle_{};
   void *dsi_fbs_[3]{};
-#ifdef USE_MIPI_DSI_BOOT_IMAGE
-  void boot_start_();
-  void boot_rect_(int x, int y, int w, int h, Color color);
-  void boot_sync_(int top, int rows);
-  void boot_ring_paint_(int head);
-  void boot_head_paint_(int head, Color color);
-  void boot_tick_();
-  void boot_stop_();
-  image::Image *boot_image_{nullptr};
-  esp_timer_handle_t boot_timer_{nullptr};
-  Color boot_background_{};
-  int boot_cx_{0};
-  int boot_cy_{0};
-  uint32_t boot_step_{0};
-  uint8_t boot_percent_{0};
-  uint8_t boot_shown_{0};
-  uint8_t boot_base_{0};
-#endif
   void *draw_fb_{nullptr};
   esp_lcd_dsi_bus_handle_t bus_handle_{};
   esp_lcd_panel_io_handle_t io_handle_{};
