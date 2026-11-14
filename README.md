@@ -76,3 +76,24 @@ The GSL3680 driver comes from Konstantin's ([kvj](https://github.com/kvj/esphome
 reached this repository through [NonaSuomy](https://github.com/NonaSuomy)'s esphomebrew - thank you both. Silead's
 GPL notice stays in its files. Everyone this project builds on:
 [ATTRIBUTIONS.md](https://github.com/p1ngb4ck/esphome/blob/dev/ATTRIBUTIONS.md).
+
+## Branch structure
+
+Each `pr/` branch holds one part of this topic on top of upstream and says in its `BRANCH.md` what it is based on. `main` holds all of them.
+
+| Branch | Based on |
+|---|---|
+| `pr/ft5x06-firmware-reads` | upstream only |
+| `pr/ft5x06-vendor-ids` | upstream only |
+| `pr/ft63x6-edt-m06` | `pr/ft5x06-firmware-reads`, `pr/ft5x06-vendor-ids`, `pr/i2c-bus-recovery-option` |
+| `pr/gsl3680` | `pr/ft5x06-firmware-reads`, `pr/ft5x06-vendor-ids`, `pr/i2c-bus-recovery-option` |
+| `pr/i2c-bus-recovery-option` | upstream only |
+| `pr/lvgl-color-depth-32` | `pr/ft5x06-firmware-reads`, `pr/ft5x06-vendor-ids`, `pr/i2c-bus-recovery-option` |
+| `pr/mipi-dsi-generic-commands` | upstream only |
+| `pr/mipi-dsi-link-options` | upstream only |
+| `pr/mipi-dsi-read-registers` | `pr/ft5x06-firmware-reads`, `pr/ft5x06-vendor-ids`, `pr/i2c-bus-recovery-option` |
+| `pr/mipi-dsi-rpi-7inch-v1` | upstream only |
+| `pr/mipi-dsi-scanout` | `pr/ft5x06-firmware-reads`, `pr/ft5x06-vendor-ids`, `pr/i2c-bus-recovery-option` |
+| `pr/mipi-dsi-video-mode` | `pr/ft5x06-vendor-ids` |
+| `pr/mipi-dsi-video-mode-only` | `pr/ft5x06-firmware-reads`, `pr/ft5x06-vendor-ids`, `pr/i2c-bus-recovery-option` |
+| `pr/mipi-i2c-init-writes` | upstream only |
