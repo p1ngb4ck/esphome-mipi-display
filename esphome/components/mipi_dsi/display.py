@@ -11,8 +11,14 @@ from esphome.components.const import (
     CONF_BYTE_ORDER,
     CONF_DRAW_ROUNDING,
 )
+from esphome.components import image
 from esphome.components.display import CONF_SHOW_TEST_CARD
-from esphome.components.esp32 import VARIANT_ESP32P4, only_on_variant
+from esphome.components.esp32 import (
+    CONF_EXECUTE_FROM_PSRAM,
+    VARIANT_ESP32P4,
+    add_idf_sdkconfig_option,
+    only_on_variant,
+)
 from esphome.components.mipi import (
     COLOR_ORDERS,
     CONF_COLOR_DEPTH,
@@ -41,10 +47,12 @@ from esphome.components.mipi import (
 )
 import esphome.config_validation as cv
 from esphome.const import (
+    CONF_ADVANCED,
     CONF_AUTO_CLEAR_ENABLED,
     CONF_COLOR_ORDER,
     CONF_DIMENSIONS,
     CONF_ENABLE_PIN,
+    CONF_FRAMEWORK,
     CONF_I2C_ID,
     CONF_ID,
     CONF_INIT_SEQUENCE,
@@ -54,7 +62,9 @@ from esphome.const import (
     CONF_ROTATION,
     CONF_TRANSFORM,
     CONF_WIDTH,
+    KEY_ESP32,
 )
+from esphome.core import CORE
 from esphome.final_validate import full_config
 from esphome.types import ConfigType
 
@@ -78,12 +88,22 @@ ColorBitness = display.display_ns.enum("ColorBitness")
 
 CONF_LANE_BIT_RATE = "lane_bit_rate"
 CONF_LANES = "lanes"
+CONF_FRAME_BUFFERS = "frame_buffers"
+CONF_BOOT_IMAGE = "boot_image"
+CONF_VIDEO_MODE = "video_mode"
 CONF_FRAME_ACK = "frame_ack"
 CONF_CONTINUOUS_CLOCK = "continuous_clock"
 CONF_VIDEO_MODE_ONLY = "video_mode_only"
+CONF_READ_REGISTERS = "read_registers"
 CONF_EOTP = "eotp"
 CONF_LP_HORIZONTAL_BLANKING = "lp_horizontal_blanking"
 CONF_LP_VERTICAL_ACTIVE = "lp_vertical_active"
+
+VIDEO_MODES = {
+    "non_burst_sync_pulses": 0,
+    "non_burst_sync_events": 1,
+    "burst": 2,
+}
 
 DsiDriverChip("CUSTOM")
 
@@ -138,6 +158,7 @@ def model_schema(config: ConfigType) -> cv.Schema:
                 cv.frequency, cv.Range(min=4e6, max=100e6)
             ),
             model.option(CONF_LANES, 2): cv.int_range(1, 2),
+            model.option(CONF_VIDEO_MODE, "burst"): cv.one_of(*VIDEO_MODES, lower=True),
             model.option(CONF_FRAME_ACK, True): cv.boolean,
             model.option(CONF_CONTINUOUS_CLOCK, False): cv.boolean,
             model.option(CONF_VIDEO_MODE_ONLY, False): cv.boolean,
@@ -147,6 +168,11 @@ def model_schema(config: ConfigType) -> cv.Schema:
             model.option(CONF_COMMAND_MODE, COMMAND_MODE_DCS): cv.one_of(
                 COMMAND_MODE_DCS, COMMAND_MODE_GENERIC, lower=True
             ),
+            model.option(CONF_READ_REGISTERS, []): cv.All(
+                cv.ensure_list(cv.uint16_t), cv.Length(max=32)
+            ),
+            cv.Optional(CONF_FRAME_BUFFERS, default=1): cv.int_range(1, 3),
+            cv.Optional(CONF_BOOT_IMAGE): cv.use_id(image.Image_),
             model.option(CONF_LANE_BIT_RATE, None): cv.All(
                 cv.bps, cv.Range(min=100e6, max=3200e6)
             ),
@@ -226,6 +252,13 @@ FINAL_VALIDATE_SCHEMA = _final_validate
 
 
 async def to_code(config: ConfigType) -> None:
+    # While flash is written (NVS, OTA) the cache is off; a DSI interrupt that waits for it makes the
+    # panel miss a frame, seen as a white flash. Code run from PSRAM does not wait for the flash.
+    if not CORE.config[KEY_ESP32][CONF_FRAMEWORK][CONF_ADVANCED][
+        CONF_EXECUTE_FROM_PSRAM
+    ]:
+        add_idf_sdkconfig_option("CONFIG_LCD_DSI_ISR_CACHE_SAFE", True)
+
     model = MODELS[config[CONF_MODEL].upper()]
     color_depth = COLOR_DEPTHS[get_color_depth(config)]
     pixel_mode = int(config[CONF_PIXEL_MODE].removesuffix("bit"))
@@ -252,12 +285,22 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_vsync_front_porch(config[CONF_VSYNC_FRONT_PORCH]))
     cg.add(var.set_pclk_frequency(config[CONF_PCLK_FREQUENCY] / 1.0e6))
     cg.add(var.set_lanes(int(config[CONF_LANES])))
+    cg.add(var.set_video_mode(VIDEO_MODES[config[CONF_VIDEO_MODE]]))
     cg.add(var.set_frame_ack(config[CONF_FRAME_ACK]))
     cg.add(var.set_continuous_clock(config[CONF_CONTINUOUS_CLOCK]))
     cg.add(var.set_eotp(config[CONF_EOTP]))
     cg.add(var.set_lp_horizontal_blanking(config[CONF_LP_HORIZONTAL_BLANKING]))
     cg.add(var.set_lp_vertical_active(config[CONF_LP_VERTICAL_ACTIVE]))
-    cg.add(var.set_generic_commands(config[CONF_COMMAND_MODE] == COMMAND_MODE_GENERIC))
+    cg.add(
+        var.set_generic_commands(config[CONF_COMMAND_MODE] == COMMAND_MODE_GENERIC)
+    )
+    if registers := config[CONF_READ_REGISTERS]:
+        table = cg.shared_progmem_array("mipi_dsi_read_registers", cg.uint16, registers)
+        cg.add(var.set_read_registers(table, len(registers)))
+    cg.add(var.set_frame_buffers(config[CONF_FRAME_BUFFERS]))
+    if boot_image := config.get(CONF_BOOT_IMAGE):
+        cg.add_define("USE_MIPI_DSI_BOOT_IMAGE")
+        cg.add(var.set_boot_image(await cg.get_variable(boot_image)))
     cg.add(var.set_lane_bit_rate(config[CONF_LANE_BIT_RATE] / 1.0e6))
     if CONF_I2C_ID in config:
         cg.add(var.set_i2c_bus(await cg.get_variable(config[CONF_I2C_ID])))
